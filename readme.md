@@ -32,7 +32,6 @@ Whether you're feeling stressed, anxious, or just need someone to listen, Aina i
 
 ```bash
 # Clone the repo
-git clone https://github.com/Sakshamyadav6/aina-companion.git
 cd aina-companion
 
 # Frontend setup
