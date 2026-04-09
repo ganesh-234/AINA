@@ -2,9 +2,9 @@
 
 > _"Aina — because sometimes, you just need to be heard."_
 
-Aina is your personal AI-powered mental wellness companion — a calm, supportive space to talk through your thoughts and emotions, whenever you need it most.
+Aina is your personal AI-powered mental wellness companion; a calm, supportive space to talk through your thoughts and emotions, whenever you need it most.
 
-Whether you're feeling stressed, anxious, or just need someone to listen, Aina is here — with empathy, not judgment.
+Whether you're feeling stressed, anxious, or just need someone to listen, Aina is here, with empathy, not judgment.
 
 ---
 
