@@ -24,7 +24,7 @@ Whether you're feeling stressed, anxious, or just need someone to listen, Aina i
 - **Frontend**: React.js, Tailwind CSS, Framer Motion
 - **Backend**: Node.js, Express.js
 - **Database**: MongoDB (Mongoose)
-- **AI Integration**: OpenAI GPT API
+- **AI Integration**: Mistral-7B API
 
 ---
 
