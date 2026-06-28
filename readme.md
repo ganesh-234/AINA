@@ -15,7 +15,7 @@ Whether you're feeling stressed, anxious, or just need someone to listen, Aina i
 - 💬 Real-time typing animations and smooth UI (Framer Motion)
 - 🌙 Soothing, mobile-first design (Tailwind CSS)
 - 🔐 Secure, private conversations
-- 🔊 (Coming soon) Voice-based interactions — talk like a real call
+- 🔊 Voice-based interactions — talk like a real call
 
 ---
 
