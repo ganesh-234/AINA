@@ -10,7 +10,7 @@ Whether you're feeling stressed, anxious, or just need someone to listen, Aina i
 
 ## ✨ Features (MVP)
 
-- 🧠 Chat with a supportive AI (OpenAI-powered)
+- 🧠 Chat with a supportive AI 
 - 🌤️ Mood check-in system with emojis
 - 💬 Real-time typing animations and smooth UI (Framer Motion)
 - 🌙 Soothing, mobile-first design (Tailwind CSS)
