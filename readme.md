@@ -40,7 +40,7 @@ AINA has two pillars that share one authentication system, database, and AI prov
 - **Multimodal ingestion** — upload PDF, Word, and text files; paste text; add a web link (article or PDF); upload images; or batch many sources at once.
 - **AI document extraction** — a multimodal model reads pages as images to perform OCR on scanned documents and to reconstruct complex tables that plain-text parsing flattens. The full mechanically-extracted text is combined with cleanly structured, AI-extracted tables for the best of both.
 - **Semantic retrieval (RAG)** — passages are embedded and ranked by meaning, so a query about a "heart attack" matches a passage on "myocardial infarction". An adaptive strategy feeds the whole document to the model when it fits, and falls back to semantic selection for large corpora.
-- **Structured templates** — Medical Report, Research Paper Analysis, Literature Synthesis, Executive Brief, and a general-purpose template, each with domain-appropriate sections and evidence-grounding instructions.
+- **Structured templates** — Medical / Clinical Report, Research Paper Analysis, Literature Synthesis, Executive Brief, and a general-purpose template, each with domain-appropriate sections and evidence-grounding instructions.
 - **Ask your documents** — ask a question and get an answer drawn strictly from your selected sources, with citations.
 - **Streaming generation** — watch a report write itself progressively.
 - **Citations & traceability** — every report records the exact passages used to ground it.
@@ -150,9 +150,9 @@ LLM_POOL=gemini,groq,openrouter,cerebras
 REPORT_PREFER_PROVIDER=gemini
 
 GEMINI_API_KEY=your_gemini_key
-GEMINI_MODEL=gemini-3.5-flash
+GEMINI_MODEL=gemini-3.6-flash
 GROQ_API_KEY=your_groq_key
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-20b
 OPENROUTER_API_KEY=your_openrouter_key
 OPENROUTER_MODEL=openrouter/free
 CEREBRAS_API_KEY=your_cerebras_key
@@ -162,7 +162,7 @@ CEREBRAS_MODEL=gpt-oss-120b
 EMBED_POOL=gemini,openrouter
 GEMINI_EMBED_MODEL=gemini-embedding-001
 EMBED_DIMS=768
-GEMINI_EXTRACT_MODEL=gemini-3.5-flash
+GEMINI_EXTRACT_MODEL=gemini-3.6-flash
 
 # Optional: Google OAuth
 GOOGLE_CLIENT_ID=your_google_client_id
