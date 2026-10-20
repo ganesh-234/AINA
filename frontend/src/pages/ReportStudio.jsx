@@ -16,6 +16,19 @@ const toPlain = (md) =>
     .replace(/\s+/g, " ")
     .trim();
 
+// The backend stores a citation map for every new report. Convert only known
+// [Source N] markers into in-page links; unknown markers remain plain text so
+// older reports continue to render normally.
+const linkCitationRefs = (markdown, citations = []) => {
+  const numbers = new Set(
+    citations.map((citation) => Number(citation.citationNumber)).filter((number) => Number.isInteger(number) && number > 0)
+  );
+  return String(markdown || "").replace(/\[Source\s+(\d+)\]/gi, (label, rawNumber) => {
+    const number = Number(rawNumber);
+    return numbers.has(number) ? `[${label}](#citation-${number})` : label;
+  });
+};
+
 const TYPE_BADGE = {
   pdf: "PDF",
   "pdf-ai": "PDF (AI)",
@@ -90,6 +103,7 @@ export default function ReportStudio() {
   const [compactReport, setCompactReport] = useState(false);
   const [showTop, setShowTop] = useState(false);
   const [batchProgress, setBatchProgress] = useState(null);
+  const [activeCitationNumber, setActiveCitationNumber] = useState(null);
 
   const loadTemplates = useCallback(async () => {
     try {
@@ -209,7 +223,7 @@ export default function ReportStudio() {
   const generate = async (e) => {
     e.preventDefault();
     if (!selected.length) return;
-    setBusy("generate"); setError(""); setReport(null); setStreamText(""); setChainStep("");
+    setBusy("generate"); setError(""); setReport(null); setStreamText(""); setChainStep(""); setActiveCitationNumber(null);
     try {
       if (perSource) {
         await streamBatch();
@@ -369,6 +383,7 @@ export default function ReportStudio() {
     try {
       const r = await axios.get(api + "/api/reports/" + id, { headers });
       setReport(r.data.report);
+      setActiveCitationNumber(null);
       window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     } catch { setError("Could not open that report."); }
   };
@@ -407,9 +422,25 @@ export default function ReportStudio() {
   };
 
   const rendered = useMemo(
-    () => (report ? DOMPurify.sanitize(marked.parse(report.content || "", { gfm: true })) : ""),
+    () => (report ? DOMPurify.sanitize(marked.parse(linkCitationRefs(report.content, report.citations), { gfm: true })) : ""),
     [report]
   );
+  const activeCitation = useMemo(
+    () => (report?.citations || []).find((citation) => Number(citation.citationNumber) === activeCitationNumber) || null,
+    [report, activeCitationNumber]
+  );
+  const selectCitation = (citationNumber) => {
+    setActiveCitationNumber(citationNumber);
+    window.setTimeout(() => document.getElementById("evidence-panel")?.scrollIntoView({ behavior: "smooth", block: "nearest" }), 0);
+  };
+  const handleReportCitationClick = (event) => {
+    const link = event.target?.closest?.("a[href^='#citation-']");
+    if (!link) return;
+    const citationNumber = Number(link.getAttribute("href")?.replace("#citation-", ""));
+    if (!Number.isInteger(citationNumber)) return;
+    event.preventDefault();
+    selectCitation(citationNumber);
+  };
   const answerRendered = useMemo(
     () => (answer ? DOMPurify.sanitize(marked.parse(answer, { gfm: true })) : ""),
     [answer]
@@ -491,7 +522,7 @@ export default function ReportStudio() {
               <form onSubmit={uploadFiles} className="mt-4 space-y-3">
                 <input type="file" multiple accept=".pdf,.docx,.txt,.md,.csv,.png,.jpg,.jpeg,.webp"
                   onChange={(e) => setFiles(e.target.files)} className={inputCls} />
-                <p className="text-xs text-slate-500">PDF, Word (.docx), text, or images. Up to 20 files, 25&nbsp;MB each.</p>
+                <p className="text-xs text-slate-500">PDF, Word (.docx), text, or images. Up to 8 files, 15&nbsp;MB each.</p>
                 <label className="flex items-start gap-2 rounded-lg bg-orange-50 p-2.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
                   <input type="checkbox" checked={aiExtract} onChange={(e) => setAiExtract(e.target.checked)} className="mt-0.5" />
                   <span><strong>High-accuracy AI extraction</strong> — best for complex tables and scanned documents. Reads the pages with AI (uses your Gemini key) instead of plain text parsing. Slower but far more accurate. Scanned PDFs and images always use this.</span>
@@ -717,7 +748,39 @@ export default function ReportStudio() {
               </div>
             </div>
             {report && <ReadAloud text={toPlain(report.content)} className="mb-4" />}
-            <div className={"report-prose " + (compactReport ? "text-sm leading-6" : "leading-7")} dangerouslySetInnerHTML={{ __html: rendered }} />
+            {report.citations?.some((citation) => Number.isInteger(Number(citation.citationNumber))) && (
+              <p className="mb-3 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                Select any <strong>[Source N]</strong> citation in the report to inspect the evidence passage used for that label.
+              </p>
+            )}
+            <div
+              onClick={handleReportCitationClick}
+              className={"report-prose " + (compactReport ? "text-sm leading-6" : "leading-7")}
+              dangerouslySetInnerHTML={{ __html: rendered }}
+            />
+            {activeCitation && (
+              <aside id="evidence-panel" className="mt-5 rounded-xl border border-orange-200 bg-orange-50 p-4 dark:border-orange-900 dark:bg-orange-950/30" aria-label={`Evidence for Source ${activeCitation.citationNumber}`}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-wide text-orange-700 dark:text-orange-300">Evidence for Source {activeCitation.citationNumber}</p>
+                    <h3 className="mt-1 font-semibold text-slate-900 dark:text-slate-100">{activeCitation.sourceTitle}</h3>
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-300">
+                      {[activeCitation.section, activeCitation.page ? `Page ${activeCitation.page}` : ""].filter(Boolean).join(" · ") || "Source excerpt"}
+                    </p>
+                  </div>
+                  <button onClick={() => setActiveCitationNumber(null)} className="rounded border border-orange-300 px-2 py-1 text-xs text-orange-700 dark:border-orange-800 dark:text-orange-300">Close evidence</button>
+                </div>
+                {activeCitation.evidenceMatch && (
+                  <span className="mt-3 inline-flex rounded bg-white px-2 py-1 text-xs font-medium text-slate-600 dark:bg-slate-900 dark:text-slate-300">
+                    {activeCitation.evidenceMatch}
+                  </span>
+                )}
+                <blockquote className="mt-3 whitespace-pre-wrap border-l-4 border-orange-300 pl-3 text-sm leading-6 text-slate-700 dark:border-orange-700 dark:text-slate-200">
+                  {activeCitation.excerpt || activeCitation.snippet}
+                </blockquote>
+                <p className="mt-3 text-xs text-slate-500">This is the source passage supplied to the model for this citation label. Check the original document before relying on a generated claim.</p>
+              </aside>
+            )}
             {report.outline && report.outline.trim() && (
               <details className="mt-6 rounded-lg border border-slate-200 p-3 text-sm dark:border-slate-700">
                 <summary className="cursor-pointer font-semibold text-slate-600 dark:text-slate-300">
@@ -729,7 +792,12 @@ export default function ReportStudio() {
             )}
             {report.citations && report.citations.length > 0 && (
               <div className="mt-6 border-t border-slate-200 pt-4 dark:border-slate-700">
-                <CitationList citations={report.citations} mode={report.retrievalMode} />
+                <CitationList
+                  citations={report.citations}
+                  mode={report.retrievalMode}
+                  activeCitationNumber={activeCitationNumber}
+                  onSelect={selectCitation}
+                />
               </div>
             )}
           </article>
@@ -746,25 +814,45 @@ export default function ReportStudio() {
   );
 }
 
-function CitationList({ citations, mode }) {
+function CitationList({ citations, mode, activeCitationNumber, onSelect }) {
   return (
     <div>
       <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
         Evidence used{mode ? ` · ${mode === "semantic-rag" ? "semantic retrieval" : "full-document context"}` : ""}
       </h3>
+      {onSelect && <p className="mt-1 text-xs text-slate-500">Select an evidence card to view its full stored excerpt.</p>}
       <div className="mt-2 space-y-2">
         {citations.map((c, i) => (
-          <div key={i} className="rounded border border-slate-200 p-2.5 text-sm dark:border-slate-700">
+          <button
+            key={c.citationNumber || i}
+            id={c.citationNumber ? `citation-${c.citationNumber}` : undefined}
+            type="button"
+            onClick={() => c.citationNumber && onSelect?.(Number(c.citationNumber))}
+            disabled={!c.citationNumber || !onSelect}
+            aria-pressed={Number(c.citationNumber) === activeCitationNumber}
+            className={`w-full rounded border p-2.5 text-left text-sm transition-colors ${
+              Number(c.citationNumber) === activeCitationNumber
+                ? "border-orange-400 bg-orange-50 dark:border-orange-700 dark:bg-orange-950/30"
+                : "border-slate-200 dark:border-slate-700"
+            } ${c.citationNumber && onSelect ? "hover:border-orange-300 focus:outline-none focus:ring-2 focus:ring-orange-400" : "cursor-default"}`}
+          >
             <div className="flex items-center justify-between gap-2">
-              <span className="font-medium text-slate-700 dark:text-slate-200">{c.sourceTitle}</span>
+              <span className="font-medium text-slate-700 dark:text-slate-200">
+                {c.citationNumber ? `Source ${c.citationNumber} · ` : ""}{c.sourceTitle}
+              </span>
               {typeof c.score === "number" && (
                 <span className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-500 dark:bg-slate-800">
                   {(c.score * 100).toFixed(0)}% match
                 </span>
               )}
             </div>
+            {(c.section || c.page || c.evidenceMatch) && (
+              <p className="mt-1 text-xs text-slate-500">
+                {[c.section, c.page ? `Page ${c.page}` : "", c.evidenceMatch].filter(Boolean).join(" · ")}
+              </p>
+            )}
             <p className="mt-1 text-xs text-slate-500">{c.snippet}…</p>
-          </div>
+          </button>
         ))}
       </div>
     </div>

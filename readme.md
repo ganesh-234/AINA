@@ -18,7 +18,7 @@ The project is designed around a practical question: *how can an AI application 
 | --- | --- |
 | Evidence workflow | Upload documents, import public articles/PDFs, or paste notes; select sources; generate a structured report; review citations; export the result. |
 | RAG | Adaptive full-document context for smaller source sets and semantic retrieval for larger corpora, with keyword fallback if embeddings are unavailable. |
-| Report quality | Medical, research, literature, executive, and general templates; evidence brief → draft → verification chain; inline `[Source N]` citations. |
+| Report quality | Medical, research, literature, executive, and general templates; evidence brief → draft → verification chain; inline `[Source N]` citations linked to stored evidence excerpts. |
 | Model resilience | Gemini-first routing for reports, Groq for fast chat, OpenRouter/Cerebras fallbacks, retries, live provider health, and streaming. |
 | Product polish | Authenticated per-user workspaces, report history, batch generation, Markdown/PDF/Word export, dark mode, and accessibility controls. |
 
@@ -68,6 +68,7 @@ Cited report
 - **Document intelligence:** sources are classified and stored with structured sections, metadata, evidence candidates, chunk/page provenance, and optional embeddings.
 - **Adaptive RAG:** AINA sends all source material when it fits the context budget; otherwise it retrieves semantically relevant chunks using cosine similarity. Keyword retrieval is a reliable fallback.
 - **Traceable answers:** “Ask your documents” answers questions only from selected sources and returns evidence snippets.
+- **Inspectable citations:** every new report stores the source, chunk, page, section, and excerpt supplied for each `[Source N]` label. Selecting a citation opens its evidence card in the report reader.
 - **Purpose-built templates:**
   - Medical / clinical report — `Clinical Summary`, diagnostic results, clinical assessment, limitations, and clinical relevance.
   - Research paper analysis — methods, results, discussion, limitations, and implications.

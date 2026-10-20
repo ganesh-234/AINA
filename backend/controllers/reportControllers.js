@@ -41,16 +41,44 @@ function chunkText(text) {
 }
 
 const keywords = (text) => new Set(String(text).toLowerCase().match(/[a-z0-9]{3,}/g) || []);
+const round3 = (n) => (typeof n === "number" ? Math.round(n * 1000) / 1000 : null);
+const snippet = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 240);
+const excerpt = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 1400);
+
+function sourceEvidenceItems(source, matchType = "full-context") {
+  const stored = (source.chunks || []).filter((chunk) => chunk && String(chunk.text || "").trim());
+  const chunks = stored.length ? stored : chunkText(source.content || "");
+  return chunks.map((chunk, i) => ({
+    sourceId: source._id,
+    sourceTitle: source.title,
+    chunkIndex: Number.isFinite(Number(chunk.index)) ? Number(chunk.index) : i,
+    page: Number(chunk.page) || 0,
+    section: String(chunk.section || "").trim(),
+    text: String(chunk.text || "").trim(),
+    embedding: chunk.embedding,
+    embedModel: source.embedModel,
+    matchType,
+  })).filter((item) => item.text);
+}
+
+function evidenceMatch(item) {
+  if (item.matchType === "semantic") {
+    if (item.score >= 0.75) return "Strong semantic match";
+    if (item.score >= 0.45) return "Related semantic match";
+    return "Review semantic match";
+  }
+  if (item.matchType === "keyword") return "Keyword match";
+  if (item.matchType === "source-level") return "Source-level parallel analysis";
+  return "Provided evidence";
+}
 
 // Rank chunks across all selected sources by keyword overlap with the query.
 function retrieve(sources, query, limit) {
   const q = keywords(query);
   const scored = sources.flatMap((s) =>
-    (s.chunks || []).map((c) => ({
-      sourceId: s._id,
-      sourceTitle: s.title,
-      text: c.text,
-      score: [...q].reduce((n, w) => n + (c.text.toLowerCase().includes(w) ? 1 : 0), 0),
+    sourceEvidenceItems(s, "keyword").map((item) => ({
+      ...item,
+      score: [...q].reduce((n, w) => n + (item.text.toLowerCase().includes(w) ? 1 : 0), 0),
     }))
   );
   // If nothing matched (e.g. very short query), fall back to leading chunks.
@@ -60,26 +88,58 @@ function retrieve(sources, query, limit) {
   return ranked.slice(0, limit || 12);
 }
 
-function buildEvidence(items) {
+function buildEvidence(items, maxChars = MAX_EVIDENCE_CHARS) {
   let out = [];
+  let citations = [];
   let used = 0;
   let n = 0;
   for (const x of items) {
-    const block = "[Source " + (n + 1) + ": " + x.sourceTitle + "]\n" + x.text;
-    if (used + block.length > MAX_EVIDENCE_CHARS && n > 0) break;
+    const location = [x.section, x.page ? "page " + x.page : ""].filter(Boolean).join(" · ");
+    const block = "[Source " + (n + 1) + ": " + x.sourceTitle + (location ? " — " + location : "") + "]\n" + x.text;
+    if (used + block.length > maxChars && n > 0) break;
     out.push(block);
     used += block.length;
     n += 1;
+    citations.push({
+      citationNumber: n,
+      sourceId: x.sourceId,
+      sourceTitle: x.sourceTitle,
+      chunkIndex: x.chunkIndex,
+      page: x.page || 0,
+      section: x.section || "",
+      snippet: snippet(x.text),
+      excerpt: excerpt(x.text),
+      score: round3(x.score),
+      evidenceMatch: evidenceMatch(x),
+    });
   }
-  return out.join("\n\n");
+  return { context: out.join("\n\n"), citations };
 }
 
-// Long-context mode: hand the model every source in full (labeled), capped.
-function buildEvidenceAll(sources) {
-  return sources
-    .map((s, i) => "[Source " + (i + 1) + ": " + s.title + "]\n" + String(s.content || "").slice(0, ADAPTIVE_MAX_CHARS))
-    .join("\n\n")
-    .slice(0, ADAPTIVE_MAX_CHARS);
+function sourceLevelCitations(sources) {
+  return sources.map((source, index) => {
+    const evidence = sourceEvidenceItems(source, "source-level")[0] || {
+      sourceId: source._id,
+      sourceTitle: source.title,
+      chunkIndex: null,
+      page: 0,
+      section: "",
+      text: String(source.content || ""),
+      matchType: "source-level",
+    };
+    return {
+      citationNumber: index + 1,
+      sourceId: evidence.sourceId,
+      sourceTitle: evidence.sourceTitle,
+      chunkIndex: evidence.chunkIndex,
+      page: evidence.page || 0,
+      section: evidence.section || "",
+      snippet: snippet(evidence.text),
+      excerpt: excerpt(evidence.text),
+      score: null,
+      evidenceMatch: evidenceMatch(evidence),
+    };
+  });
 }
 
 // Ensure every selected source has chunk embeddings; embed + persist any that
@@ -107,24 +167,18 @@ async function ensureEmbeddings(sources) {
 // Falls back to keyword scoring when embeddings are unavailable.
 async function semanticRetrieve(sources, query, limit) {
   const q = await embedQuery(query).catch(() => null);
-  const flat = sources.flatMap((s) =>
-    (s.chunks || []).map((c) => ({ sourceTitle: s.title, text: c.text, embedding: c.embedding, embedModel: s.embedModel }))
-  );
+  const flat = sources.flatMap((s) => sourceEvidenceItems(s, "semantic"));
   const usable = q && flat.some((c) => c.embedding && c.embedding.length && c.embedModel === q.model);
   if (!usable) return retrieve(sources, query, limit); // keyword fallback
 
   return flat
     .map((c) => ({
-      sourceTitle: c.sourceTitle,
-      text: c.text,
+      ...c,
       score: c.embedding && c.embedModel === q.model ? cosine(q.vector, c.embedding) : -1,
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 }
-
-const round3 = (n) => (typeof n === "number" ? Math.round(n * 1000) / 1000 : null);
-const snippet = (t) => String(t || "").replace(/\s+/g, " ").trim().slice(0, 240);
 
 // Clean up common model artifacts so the saved report reads as a finished document:
 // unwrap an outer code fence, drop a dangling unterminated fence, and strip
@@ -171,19 +225,12 @@ function sanitizeReport(md) {
 async function buildContext(sources, query) {
   const totalChars = sources.reduce((n, s) => n + (s.content ? s.content.length : 0), 0);
   if (totalChars <= ADAPTIVE_MAX_CHARS) {
-    return {
-      context: buildEvidenceAll(sources),
-      retrievalMode: "long-context",
-      citations: sources.map((s) => ({ sourceTitle: s.title, snippet: snippet(s.content), score: null })),
-    };
+    const all = buildEvidence(sources.flatMap((source) => sourceEvidenceItems(source)), ADAPTIVE_MAX_CHARS);
+    return { ...all, retrievalMode: "long-context" };
   }
   await ensureEmbeddings(sources);
   const selected = await semanticRetrieve(sources, query, 16);
-  return {
-    context: buildEvidence(selected),
-    retrievalMode: "semantic-rag",
-    citations: selected.slice(0, 8).map((x) => ({ sourceTitle: x.sourceTitle, snippet: snippet(x.text), score: round3(x.score) })),
-  };
+  return { ...buildEvidence(selected), retrievalMode: "semantic-rag" };
 }
 
 function reportUserPrompt(tpl, title, objective, context) {
@@ -442,7 +489,7 @@ async function generateOneReport(userId, { title, objective, template, sourceIds
   const sources = await Source.find({ _id: { $in: sourceIds }, userId }).lean();
   if (!sources.length) throw new Error("No matching sources were found for this report.");
 
-  const { context, retrievalMode, citations } = await buildContext(sources, title + " " + objective);
+  const { context, retrievalMode, citations: contextCitations } = await buildContext(sources, title + " " + objective);
 
   const opts = REPORT_GEN_OPTS(tpl);
   opts.maxTokens = reportTokenBudget(sources.length);
@@ -453,6 +500,9 @@ async function generateOneReport(userId, { title, objective, template, sourceIds
   let content = "";
   let brief = "";
   let generationMode = "single-pass";
+  // Map-reduce reports cite whole per-source analyses; make that distinction
+  // explicit instead of pretending a synthesis citation identifies one chunk.
+  let citations = contextCitations;
 
   if (useParallel) {
     const providers = getProviderStatus().filter((p) => p.configured).map((p) => p.key);
@@ -460,6 +510,7 @@ async function generateOneReport(userId, { title, objective, template, sourceIds
     content = sanitizeReport(await gen(buildSynthesisPrompt(tpl, title, objective, analyses), {}));
     brief = sanitizeReport(analyses.map((a) => "### " + a.title + "\n" + a.analysis).join("\n\n")).slice(0, 8000);
     generationMode = "parallel-map-reduce";
+    citations = sourceLevelCitations(sources);
   } else if (useChain) {
     const r = await generateChainedReport({
       tpl, title, objective, context, opts,
@@ -685,7 +736,7 @@ async function generateReportStream(req, res) {
       send("error", { error: "No matching sources were found." });
       return res.end();
     }
-    const { context, retrievalMode, citations } = await buildContext(sources, title + " " + objective);
+    const { context, retrievalMode, citations: contextCitations } = await buildContext(sources, title + " " + objective);
     send("meta", { retrievalMode });
 
     const opts = REPORT_GEN_OPTS(tpl);
@@ -713,6 +764,7 @@ async function generateReportStream(req, res) {
     let finalText = "";
     let brief = "";
     let generationMode = "single-pass";
+    let citations = contextCitations;
 
     if (useParallel) {
       const providers = getProviderStatus().filter((p) => p.configured).map((p) => p.key);
@@ -721,6 +773,7 @@ async function generateReportStream(req, res) {
       finalText = sanitizeReport(await streamDraft(buildSynthesisPrompt(tpl, title, objective, analyses), {}));
       brief = sanitizeReport(analyses.map((a) => "### " + a.title + "\n" + a.analysis).join("\n\n")).slice(0, 8000);
       generationMode = "parallel-map-reduce";
+      citations = sourceLevelCitations(sources);
     } else if (useChain) {
       const r = await generateChainedReport({
         tpl, title, objective, context, opts,
@@ -779,7 +832,8 @@ async function askDocuments(req, res) {
 
     await ensureEmbeddings(sources);
     const selected = await semanticRetrieve(sources, question, 8);
-    const context = buildEvidence(selected);
+    const evidence = buildEvidence(selected);
+    const context = evidence.context;
     const system =
       "You are AINA, answering questions strictly from the supplied evidence about the user's own documents. " +
       "Cite supporting claims as [Source N]. If the evidence does not contain the answer, say so plainly instead of guessing. " +
@@ -796,7 +850,7 @@ async function askDocuments(req, res) {
         })
       )
     );
-    const citations = selected.slice(0, 6).map((x) => ({ sourceTitle: x.sourceTitle, snippet: snippet(x.text), score: round3(x.score) }));
+    const citations = evidence.citations.slice(0, 6);
     askCacheSet(ckey, { answer, citations });
     res.json({ answer, citations });
   } catch (e) {
@@ -918,4 +972,6 @@ module.exports = {
   deleteReport,
   duplicateReport,
   exportReport,
+  // Pure evidence helpers exposed for deterministic unit coverage.
+  __test: { buildEvidence, sourceEvidenceItems, sourceLevelCitations },
 };
