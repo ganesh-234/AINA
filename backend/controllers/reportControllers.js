@@ -6,13 +6,25 @@ const Report = require("../models/Report");
 const { generateResponse, generateResponseStream, getProviderStatus, checkProviders } = require("../services/llmService");
 const { extractFromBuffer, extractFromUrl } = require("../services/extractService");
 const { resolveTemplate, listTemplates } = require("../services/reportTemplates");
+const { generateChainedReport } = require("../services/promptChainService");
+const { analyzeSources, buildSynthesisPrompt } = require("../services/parallelReportService");
 const { markdownToHtml, markdownToDocx, markdownToPdf } = require("../services/exportService");
 const { embedDocuments, embedQuery, cosine, getEmbeddingStatus } = require("../services/embeddingService");
+const { buildDocumentIntelligence, chunkStructuredDocument } = require("../services/documentIntelligenceService");
+
+/* In-memory cache for "Ask your documents" answers, keyed by question + source set. */
+const ASK_CACHE = new Map();
+const ASK_CACHE_TTL = parseInt(process.env.ASK_CACHE_TTL_MS || "600000", 10);
+const ASK_CACHE_MAX = parseInt(process.env.ASK_CACHE_MAX || "200", 10);
+const askCacheKey = (q, ids) => [...ids].sort().join(",") + "::" + String(q).toLowerCase().replace(/\s+/g, " ").trim();
+function askCacheGet(k) { const h = ASK_CACHE.get(k); if (!h) return null; if (Date.now() - h.t > ASK_CACHE_TTL) { ASK_CACHE.delete(k); return null; } return h.v; }
+function askCacheSet(k, v) { if (ASK_CACHE.size >= ASK_CACHE_MAX) ASK_CACHE.delete(ASK_CACHE.keys().next().value); ASK_CACHE.set(k, { t: Date.now(), v }); }
 
 /* ------------------------------------------------------------------ */
 /* Text helpers                                                        */
 /* ------------------------------------------------------------------ */
 const MAX_SOURCE_CHARS = 2_000_000;
+const MAX_UPLOAD_TOTAL_BYTES = parseInt(process.env.REPORT_UPLOAD_MAX_TOTAL_BYTES || String(50 * 1024 * 1024), 10);
 const MAX_EVIDENCE_CHARS = 14_000; // context budget handed to the model when using RAG retrieval
 // If the combined source text fits within this budget, feed it ALL to the model
 // (long-context mode, no retrieval loss). Above it, fall back to semantic RAG.
@@ -190,21 +202,40 @@ function reportUserPrompt(tpl, title, objective, context) {
   );
 }
 
+// Output budget for report generation. Scales with the number of sources so a
+// multi-document report is not truncated mid-section, capped at REPORT_MAX_TOKENS.
+const REPORT_MAX_TOKENS = parseInt(process.env.REPORT_MAX_TOKENS || "8000", 10);
+const reportTokenBudget = (n) => Math.min(REPORT_MAX_TOKENS, 4000 + 1500 * Math.max(1, n || 1));
+
 const REPORT_GEN_OPTS = (tpl) => ({
   systemPrompt: tpl.system,
-  maxTokens: 3500,
+  maxTokens: REPORT_MAX_TOKENS,
   temperature: 0.5,
   preserveNewlines: true,
   throwOnFailure: true,
+  taskType: "report-generation",
+  preferLongContext: true,
   preferProvider: process.env.REPORT_PREFER_PROVIDER || "gemini",
 });
+
+// Resolve a boolean flag from the request body, falling back to an env default.
+// Accepts true/false, "true"/"false", "on"/"off", 1/0.
+function flag(value, envName, envDefault) {
+  if (value !== undefined && value !== null && value !== "") {
+    if (typeof value === "boolean") return value;
+    const v = String(value).toLowerCase();
+    if (["true", "on", "1", "yes"].includes(v)) return true;
+    if (["false", "off", "0", "no"].includes(v)) return false;
+  }
+  return (process.env[envName] || envDefault).toLowerCase() !== "off";
+}
 
 const isFallbackModelResponse = (text) =>
   /^I.m here to help, but I don.t currently have a connected AI service\./.test(String(text || ""));
 
 function requireLiveModel(text) {
   if (isFallbackModelResponse(text)) {
-    throw new Error("The AI provider is unavailable. Check GROQ_API_KEY / HF_API_KEY and try again.");
+    throw new Error("No configured AI provider is currently available. Check the Provider health panel and try again.");
   }
   return text;
 }
@@ -214,7 +245,17 @@ function requireLiveModel(text) {
 /* ------------------------------------------------------------------ */
 async function persistSource(userId, { title, text, meta }) {
   const content = String(text || "").slice(0, MAX_SOURCE_CHARS);
-  const chunks = chunkText(content);
+  let intelligence;
+  let chunks;
+  try {
+    intelligence = buildDocumentIntelligence({ title, text: content, meta: meta || {} });
+    chunks = chunkStructuredDocument(intelligence);
+  } catch (e) {
+    // Source ingestion must remain available for unusual or malformed files.
+    console.warn("[reports] document intelligence failed; using plain chunks:", e.message);
+    chunks = chunkText(content);
+  }
+  if (!chunks.length && content) chunks = chunkText(content);
 
   // Compute semantic embeddings for each chunk (RAG). Non-fatal on failure —
   // retrieval falls back to keyword search when embeddings are absent.
@@ -235,6 +276,10 @@ async function persistSource(userId, { title, text, meta }) {
     content,
     chunks,
     embedModel,
+    documentType: intelligence?.classification || "other",
+    documentMetadata: intelligence?.metadata || {},
+    sections: intelligence?.sections || [],
+    evidence: intelligence?.evidence || [],
     sourceType: (meta && meta.kind) || "paste",
     originalName: (meta && meta.originalName) || "",
     url: (meta && meta.url) || "",
@@ -273,6 +318,10 @@ async function uploadSources(req, res) {
   try {
     const files = req.files || [];
     if (!files.length) return res.status(400).json({ error: "No files were uploaded." });
+    const totalBytes = files.reduce((sum, file) => sum + (file.size || file.buffer?.length || 0), 0);
+    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      return res.status(413).json({ error: "The combined upload is too large. Upload fewer or smaller files." });
+    }
     const mode = ["ai", "fast", "auto"].includes(req.body.mode) ? req.body.mode : "auto";
     const created = [];
     const failed = [];
@@ -312,13 +361,14 @@ async function addSourceFromUrl(req, res) {
 async function listSources(req, res) {
   const sources = await Source.find({ userId: req.user.id })
     .sort({ createdAt: -1 })
-    .select("title chunks sourceType originalName url pages charCount createdAt")
+    .select("title chunks sourceType documentType originalName url pages charCount createdAt")
     .lean();
   res.json({
     sources: sources.map((s) => ({
       _id: s._id,
       title: s.title,
       sourceType: s.sourceType,
+      documentType: s.documentType || "other",
       chunkCount: (s.chunks || []).length,
       charCount: s.charCount || 0,
       pages: s.pages || 0,
@@ -341,7 +391,7 @@ async function listReports(req, res) {
   res.json({
     reports: await Report.find({ userId: req.user.id })
       .sort({ createdAt: -1 })
-      .select("title objective template templateLabel status batchId createdAt updatedAt")
+      .select("title objective template templateLabel generationMode status batchId createdAt updatedAt")
       .lean(),
   });
 }
@@ -387,17 +437,42 @@ async function runWithConcurrency(items, worker, concurrency) {
 /* ------------------------------------------------------------------ */
 /* Report generation                                                   */
 /* ------------------------------------------------------------------ */
-async function generateOneReport(userId, { title, objective, template, sourceIds, batchId }) {
+async function generateOneReport(userId, { title, objective, template, sourceIds, batchId, chain, refine, parallel }) {
   const tpl = resolveTemplate(template);
   const sources = await Source.find({ _id: { $in: sourceIds }, userId }).lean();
   if (!sources.length) throw new Error("No matching sources were found for this report.");
 
   const { context, retrievalMode, citations } = await buildContext(sources, title + " " + objective);
-  console.log(`[reports] "${title}" using ${retrievalMode}`);
 
-  const draft = sanitizeReport(
-    requireLiveModel(await generateResponse([], reportUserPrompt(tpl, title, objective, context), REPORT_GEN_OPTS(tpl)))
-  );
+  const opts = REPORT_GEN_OPTS(tpl);
+  opts.maxTokens = reportTokenBudget(sources.length);
+  const gen = async (msg, o) => requireLiveModel(await generateResponse([], msg, { ...opts, ...o }));
+  const useChain = flag(chain, "REPORT_CHAINING", "on");
+  const useParallel = flag(parallel, "REPORT_PARALLEL", "off") && sources.length >= 2;
+
+  let content = "";
+  let brief = "";
+  let generationMode = "single-pass";
+
+  if (useParallel) {
+    const providers = getProviderStatus().filter((p) => p.configured).map((p) => p.key);
+    const analyses = await analyzeSources({ tpl, objective, sources, generate: gen, providers });
+    content = sanitizeReport(await gen(buildSynthesisPrompt(tpl, title, objective, analyses), {}));
+    brief = sanitizeReport(analyses.map((a) => "### " + a.title + "\n" + a.analysis).join("\n\n")).slice(0, 8000);
+    generationMode = "parallel-map-reduce";
+  } else if (useChain) {
+    const r = await generateChainedReport({
+      tpl, title, objective, context, opts,
+      draftGenerate: gen, auxGenerate: gen,
+      refine: flag(refine, "CHAIN_VERIFY", "on"),
+    });
+    content = sanitizeReport(r.content);
+    brief = sanitizeReport(r.brief || "");
+    generationMode = r.mode;
+  } else {
+    content = sanitizeReport(await gen(reportUserPrompt(tpl, title, objective, context), {}));
+  }
+  console.log(`[reports] "${title}" using ${retrievalMode} / ${generationMode}`);
 
   const report = await Report.create({
     userId,
@@ -405,10 +480,11 @@ async function generateOneReport(userId, { title, objective, template, sourceIds
     objective,
     template: tpl.key,
     templateLabel: tpl.label,
-    outline: "",
-    content: draft,
+    outline: brief,
+    content,
     citations,
     retrievalMode,
+    generationMode,
     sourceIds: sources.map((s) => s._id),
     sourceTitles: sources.map((s) => s.title),
     status: "complete",
@@ -426,7 +502,10 @@ async function generateReport(req, res) {
     if (!title || !objective || !sourceIds.length) {
       return res.status(400).json({ error: "Title, objective, and at least one source are required." });
     }
-    const report = await generateOneReport(req.user.id, { title, objective, template, sourceIds });
+    const report = await generateOneReport(req.user.id, {
+      title, objective, template, sourceIds,
+      chain: req.body.chain, refine: req.body.refine, parallel: req.body.parallel,
+    });
     res.status(201).json({ report });
   } catch (e) {
     console.error("[reports] generateReport", e.message);
@@ -483,6 +562,9 @@ async function generateBatch(req, res) {
             template: job.template || "generic",
             sourceIds,
             batchId,
+            chain: job.chain !== undefined ? job.chain : req.body.chain,
+            refine: job.refine !== undefined ? job.refine : req.body.refine,
+            parallel: job.parallel !== undefined ? job.parallel : req.body.parallel,
           });
           return { reportId: report._id, title: report.title, status: "complete" };
         } catch (err) {
@@ -496,6 +578,86 @@ async function generateBatch(req, res) {
   } catch (e) {
     console.error("[reports] generateBatch", e.message);
     res.status(500).json({ error: e.message || "Unable to run the batch." });
+  }
+}
+
+// Streaming BATCH generation via Server-Sent Events: emits one progress
+// event as each report in the batch finishes, so the client can show live
+// "N of M done" instead of waiting for the whole batch.
+async function generateBatchStream(req, res) {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (res.flushHeaders) res.flushHeaders();
+  const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    let jobs = Array.isArray(req.body.jobs) ? req.body.jobs : [];
+    if (!jobs.length && req.body.perSource) {
+      const objective = String(req.body.objective || "").trim();
+      const template = req.body.template || "generic";
+      const sourceIds = Array.isArray(req.body.sourceIds) ? req.body.sourceIds : [];
+      if (!objective || !sourceIds.length) {
+        send("error", { error: "An objective and at least one source are required." });
+        return res.end();
+      }
+      const sources = await Source.find({ _id: { $in: sourceIds }, userId: req.user.id }).select("title").lean();
+      jobs = sources.map((sMeta) => ({ title: sMeta.title, objective, template, sourceIds: [String(sMeta._id)] }));
+    }
+    if (!jobs.length) { send("error", { error: "Provide jobs or perSource with sources." }); return res.end(); }
+    if (jobs.length > 50) { send("error", { error: "A batch is limited to 50 reports at a time." }); return res.end(); }
+
+    const batchId = crypto.randomUUID();
+    const providerCount = getProviderStatus().filter((p) => p.configured).length || 1;
+    const concurrency = parseInt(process.env.LLM_BATCH_CONCURRENCY || String(Math.max(2, providerCount)), 10);
+
+    send("start", { total: jobs.length, batchId, concurrency });
+
+    let done = 0;
+    const results = await runWithConcurrency(
+      jobs,
+      async (job) => {
+        const title = String(job.title || "").trim();
+        const objective = String(job.objective || "").trim();
+        const sourceIds = Array.isArray(job.sourceIds) ? job.sourceIds : [];
+        let out;
+        if (!title || !objective || !sourceIds.length) {
+          out = { title: title || "(untitled)", status: "failed", error: "Missing title, objective, or sources." };
+        } else {
+          try {
+            const report = await generateOneReport(req.user.id, {
+              title, objective, template: job.template || "generic", sourceIds, batchId,
+              chain: job.chain !== undefined ? job.chain : req.body.chain,
+              refine: job.refine !== undefined ? job.refine : req.body.refine,
+              parallel: job.parallel !== undefined ? job.parallel : req.body.parallel,
+            });
+            out = { reportId: report._id, title: report.title, status: "complete" };
+          } catch (err) {
+            out = { title, status: "failed", error: err.message };
+          }
+        }
+        done += 1;
+        send("progress", { done, total: jobs.length, reportId: out.reportId || null, title: out.title, status: out.status, error: out.error || null });
+        return out;
+      },
+      concurrency
+    );
+
+    const completed = results.filter((r) => r.status === "complete");
+    send("done", {
+      batchId,
+      count: results.length,
+      completed: completed.length,
+      failed: results.length - completed.length,
+      firstReportId: (completed[0] && completed[0].reportId) || null,
+      results,
+    });
+    res.end();
+  } catch (e) {
+    console.error("[reports] generateBatchStream", e.message);
+    try { send("error", { error: e.message || "Unable to run the batch." }); } catch { /* client gone */ }
+    res.end();
   }
 }
 
@@ -526,14 +688,54 @@ async function generateReportStream(req, res) {
     const { context, retrievalMode, citations } = await buildContext(sources, title + " " + objective);
     send("meta", { retrievalMode });
 
-    const rawText = await generateResponseStream(
-      [],
-      reportUserPrompt(tpl, title, objective, context),
-      REPORT_GEN_OPTS(tpl),
-      (delta) => send("token", { t: delta })
-    );
-    if (isFallbackModelResponse(rawText)) throw new Error("The AI provider is unavailable.");
-    const finalText = sanitizeReport(rawText);
+    const opts = REPORT_GEN_OPTS(tpl);
+    opts.maxTokens = reportTokenBudget(sources.length);
+    // Non-streaming call used by the analyze/verify steps of the chain.
+    const gen = async (msg, o) => {
+      const t = await generateResponse([], msg, { ...opts, ...o });
+      if (isFallbackModelResponse(t)) throw new Error("The AI provider is unavailable.");
+      return t;
+    };
+    // Streaming call used for the visible draft step.
+    const streamDraft = async (msg, o) => {
+      const t = await generateResponseStream([], msg, { ...opts, ...o }, (delta) => send("token", { t: delta }));
+      if (isFallbackModelResponse(t)) throw new Error("The AI provider is unavailable.");
+      return t;
+    };
+
+    const useChain = flag(req.body.chain, "REPORT_CHAINING", "on");
+    // For the streamed path, verification is off by default so that what the
+    // user watches being written is exactly what is saved (the analyze step
+    // still runs and grounds the draft). Opt in with refine / CHAIN_VERIFY_STREAM.
+    const refine = flag(req.body.refine, "CHAIN_VERIFY_STREAM", "off");
+    const useParallel = flag(req.body.parallel, "REPORT_PARALLEL", "off") && sources.length >= 2;
+
+    let finalText = "";
+    let brief = "";
+    let generationMode = "single-pass";
+
+    if (useParallel) {
+      const providers = getProviderStatus().filter((p) => p.configured).map((p) => p.key);
+      const analyses = await analyzeSources({ tpl, objective, sources, generate: gen, providers, onStep: (l) => send("step", { label: l }) });
+      send("step", { label: "Synthesising report" });
+      finalText = sanitizeReport(await streamDraft(buildSynthesisPrompt(tpl, title, objective, analyses), {}));
+      brief = sanitizeReport(analyses.map((a) => "### " + a.title + "\n" + a.analysis).join("\n\n")).slice(0, 8000);
+      generationMode = "parallel-map-reduce";
+    } else if (useChain) {
+      const r = await generateChainedReport({
+        tpl, title, objective, context, opts,
+        draftGenerate: streamDraft, auxGenerate: gen, refine,
+        onStep: (name, info) => send("step", { name, ...(info || {}) }),
+      });
+      finalText = sanitizeReport(r.content);
+      brief = sanitizeReport(r.brief || "");
+      generationMode = r.mode;
+      // If a verify pass rewrote the streamed draft, tell the client to swap in
+      // the corrected text before it renders the final report.
+      if (generationMode.includes("verified")) send("final", { content: finalText });
+    } else {
+      finalText = sanitizeReport(await streamDraft(reportUserPrompt(tpl, title, objective, context), {}));
+    }
 
     const report = await Report.create({
       userId: req.user.id,
@@ -541,15 +743,16 @@ async function generateReportStream(req, res) {
       objective,
       template: tpl.key,
       templateLabel: tpl.label,
-      outline: "",
+      outline: brief,
       content: finalText,
       citations,
       retrievalMode,
+      generationMode,
       sourceIds: sources.map((s) => s._id),
       sourceTitles: sources.map((s) => s.title),
       status: "complete",
     });
-    send("done", { reportId: report._id, citations, retrievalMode });
+    send("done", { reportId: report._id, citations, retrievalMode, generationMode });
     res.end();
   } catch (e) {
     console.error("[reports] generateReportStream", e.message);
@@ -568,6 +771,9 @@ async function askDocuments(req, res) {
     if (!question || !sourceIds.length) {
       return res.status(400).json({ error: "A question and at least one source are required." });
     }
+    const ckey = askCacheKey(question, sourceIds);
+    const cachedAns = askCacheGet(ckey);
+    if (cachedAns) return res.json({ ...cachedAns, cached: true });
     const sources = await Source.find({ _id: { $in: sourceIds }, userId: req.user.id }).lean();
     if (!sources.length) return res.status(404).json({ error: "No matching sources were found." });
 
@@ -582,7 +788,7 @@ async function askDocuments(req, res) {
       requireLiveModel(
         await generateResponse([], `Question: ${question}\n\nEvidence:\n${context}`, {
           systemPrompt: system,
-          maxTokens: 900,
+          maxTokens: 1500,
           temperature: 0.3,
           preserveNewlines: true,
           throwOnFailure: true,
@@ -591,6 +797,7 @@ async function askDocuments(req, res) {
       )
     );
     const citations = selected.slice(0, 6).map((x) => ({ sourceTitle: x.sourceTitle, snippet: snippet(x.text), score: round3(x.score) }));
+    askCacheSet(ckey, { answer, citations });
     res.json({ answer, citations });
   } catch (e) {
     console.error("[reports] askDocuments", e.message);
@@ -705,6 +912,7 @@ module.exports = {
   generateReport,
   generateReportStream,
   generateBatch,
+  generateBatchStream,
   askDocuments,
   renameReport,
   deleteReport,

@@ -19,24 +19,26 @@ const BASE_RULES = [
   "If tabular data in the evidence looks garbled, incomplete, or ambiguous, summarise the relevant findings in clear prose or a clean table, rather than reproducing uncertain raw numbers or speculating about the original table's structure.",
 ].join(" ");
 
-const MEDICAL_SAFETY =
-  " This is an analytical summary of source documents, not medical advice or a diagnosis. Where appropriate, note that clinical decisions require a qualified professional.";
+const MEDICAL_RULES =
+  " Write this as a clinical medical report, not an executive, business, product, or management brief. " +
+  "Use clinically appropriate terminology and the exact section headings requested. Do not use headings such as 'Executive Summary', 'Bottom Line', 'Key Points', or 'Recommended Next Steps'. " +
+  "This is an analytical summary of source documents, not medical advice or a diagnosis. Where appropriate, note that clinical decisions require a qualified professional.";
 
 const TEMPLATES = {
   medical: {
-    label: "Medical report",
+    label: "Medical / clinical report",
     description: "Structured analysis of clinical / medical documents.",
     sections: [
-      "Executive Summary",
-      "Clinical Context",
-      "Key Findings",
+      "Clinical Summary",
+      "Clinical Context & Scope",
+      "Findings From the Evidence",
       "Diagnostic & Test Results",
-      "Assessment",
+      "Clinical Assessment",
       "Limitations & Data Gaps",
       "Clinical Relevance & Recommendations",
       "Sources Used",
     ],
-    system: BASE_RULES + MEDICAL_SAFETY,
+    system: BASE_RULES + MEDICAL_RULES,
   },
   research: {
     label: "Research paper analysis",
