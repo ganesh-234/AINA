@@ -1,0 +1,274 @@
+/* High Contrast Mode Styles */
+:root {
+  --animation-duration: 200ms;
+}
+
+.high-contrast {
+  /* Enhanced contrast for text */
+  --tw-prose-body: #000000;
+  --tw-prose-headings: #000000;
+  --tw-prose-links: #0000EE;
+  --tw-prose-bold: #000000;
+  --tw-prose-counters: #000000;
+  --tw-prose-bullets: #000000;
+  --tw-prose-hr: #000000;
+  --tw-prose-quotes: #000000;
+  --tw-prose-quote-borders: #000000;
+  --tw-prose-captions: #000000;
+  --tw-prose-code: #000000;
+  --tw-prose-pre-code: #FFFFFF;
+  --tw-prose-pre-bg: #000000;
+  --tw-prose-th-borders: #000000;
+  --tw-prose-td-borders: #000000;
+
+  /* High contrast borders */
+  --border-color: #000000;
+
+  /* High contrast backgrounds */
+  --bg-primary: #FFFFFF;
+  --bg-secondary: #F0F0F0;
+
+  /* Button contrast */
+  --button-bg: #000000;
+  --button-text: #FFFFFF;
+  --button-hover-bg: #333333;
+}
+
+.high-contrast * {
+  border-color: var(--border-color) !important;
+}
+
+.high-contrast button {
+  background-color: var(--button-bg) !important;
+  color: var(--button-text) !important;
+  border: 2px solid var(--border-color) !important;
+}
+
+.high-contrast button:hover {
+  background-color: var(--button-hover-bg) !important;
+}
+
+.high-contrast input,
+.high-contrast textarea,
+.high-contrast select {
+  border: 2px solid var(--border-color) !important;
+  background-color: var(--bg-primary) !important;
+  color: #000000 !important;
+}
+
+.high-contrast a {
+  color: #0000EE !important;
+  text-decoration: underline !important;
+}
+
+.high-contrast a:visited {
+  color: #551A8B !important;
+}
+
+/* Focus indicators - WCAG 2.2 Level AA requirement */
+*:focus {
+  outline: 3px solid #005FCC;
+  outline-offset: 2px;
+}
+
+*:focus:not(:focus-visible) {
+  outline: none;
+}
+
+*:focus-visible {
+  outline: 3px solid #005FCC;
+  outline-offset: 2px;
+}
+
+/* Skip to main content link - WCAG 2.2 requirement */
+.skip-to-main {
+  position: absolute;
+  left: -9999px;
+  z-index: 999;
+  padding: 1rem;
+  background-color: #005FCC;
+  color: white;
+  text-decoration: none;
+  border-radius: 0 0 0.5rem 0;
+}
+
+.skip-to-main:focus {
+  left: 0;
+  top: 0;
+}
+
+/* Screen reader only content */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Ensure minimum touch target size - WCAG 2.2 */
+button,
+a,
+input[type="checkbox"],
+input[type="radio"],
+[role="button"],
+[role="link"] {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+/* Enhanced keyboard navigation visibility */
+:focus {
+  outline: 3px solid #005FCC;
+  outline-offset: 2px;
+}
+
+button:focus,
+a:focus,
+input:focus,
+textarea:focus,
+select:focus {
+  box-shadow: 0 0 0 3px rgba(0, 95, 204, 0.3);
+}
+
+/* Ensure color contrast meets WCAG AA (4.5:1 for normal text) */
+body {
+  color: #1a1a1a;
+  background-color: #ffffff;
+}
+
+.dark body {
+  color: #f0f0f0;
+  background-color: #1a1a1a;
+}
+
+/* Text spacing - WCAG 2.2 */
+p,
+li,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  line-height: 1.5;
+  letter-spacing: 0.12em;
+  word-spacing: 0.16em;
+}
+
+/* Ensure form labels are associated */
+label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-weight: 500;
+}
+
+/* Visible focus for all interactive elements */
+a:focus,
+button:focus,
+input:focus,
+textarea:focus,
+select:focus,
+[tabindex]:focus {
+  outline: 3px solid #005FCC;
+  outline-offset: 2px;
+}
+
+/* Error states with sufficient contrast */
+.error,
+[aria-invalid="true"] {
+  border-color: #DC2626 !important;
+  color: #991B1B;
+}
+
+.error-message {
+  color: #991B1B;
+  font-weight: 500;
+  margin-top: 0.25rem;
+}
+
+/* Status messages with proper ARIA */
+[role="alert"],
+[role="status"] {
+  padding: 1rem;
+  border-radius: 0.5rem;
+  border: 2px solid currentColor;
+}
+
+[role="alert"] {
+  background-color: #FEE2E2;
+  color: #991B1B;
+}
+
+[role="status"] {
+  background-color: #DBEAFE;
+  color: #1E40AF;
+}
+
+/* Loading states */
+.loading {
+  position: relative;
+}
+
+.loading::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 20px;
+  height: 20px;
+  margin: -10px 0 0 -10px;
+  border: 2px solid rgba(0, 0, 0, 0.1);
+  border-top-color: #005FCC;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Ensure table accessibility */
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  background-color: #F3F4F6;
+  padding: 0.75rem;
+  border: 1px solid #D1D5DB;
+}
+
+td {
+  padding: 0.75rem;
+  border: 1px solid #D1D5DB;
+}
+
+/* Caption for tables */
+caption {
+  padding: 0.75rem;
+  text-align: left;
+  font-weight: 600;
+  font-size: 1.125rem;
+}

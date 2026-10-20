@@ -11,10 +11,12 @@ import Contact from "./pages/Contact";
 import OAuthSuccess from "./components/OAuthSuccess";
 import SecureRoutes from "./routes/SecureRoutes";
 import ReportStudio from "./pages/ReportStudio";
+import { AccessibilityPanel } from "./components/Accessibility";
 
 function App() {
   return (
     <>
+      <AccessibilityPanel />
       <Routes>
         <Route path="/" element={<Home />} />
         <Route path="/about" element={<About />} />

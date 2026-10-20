@@ -3,8 +3,18 @@ import { useSelector } from "react-redux";
 import axios from "axios";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
+import { VoiceInput, ReadAloud } from "../components/Accessibility";
 
 const api = import.meta.env.VITE_SERVER_URL;
+
+const toPlain = (md) =>
+  String(md || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/[#>*_`~|]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
 const TYPE_BADGE = {
   pdf: "PDF",
@@ -16,6 +26,16 @@ const TYPE_BADGE = {
   url: "Link",
   paste: "Pasted",
   file: "File",
+};
+
+const DOC_BADGE = {
+  "research-paper": "Research",
+  "clinical-trial": "Trial",
+  "medical-report": "Medical",
+  "review": "Review",
+  "case-study": "Case study",
+  guideline: "Guideline",
+  dataset: "Dataset",
 };
 
 function SourceBadge({ type }) {
@@ -34,6 +54,7 @@ export default function ReportStudio() {
   const [templates, setTemplates] = useState([]);
   const [sources, setSources] = useState([]);
   const [reports, setReports] = useState([]);
+  const [reportSearch, setReportSearch] = useState("");
   const [selected, setSelected] = useState([]);
 
   const [files, setFiles] = useState([]);
@@ -55,11 +76,20 @@ export default function ReportStudio() {
   const [health, setHealth] = useState({});
   const [checking, setChecking] = useState(false);
   const [useStream, setUseStream] = useState(true);
+  const [chainMode, setChainMode] = useState(true);
+  const [parallelMode, setParallelMode] = useState(false);
+  const [chainStep, setChainStep] = useState("");
   const [streamText, setStreamText] = useState("");
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState(null);
   const [answerCitations, setAnswerCitations] = useState([]);
+  const [answerCached, setAnswerCached] = useState(false);
   const [asking, setAsking] = useState(false);
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
+  const [reportsLoaded, setReportsLoaded] = useState(false);
+  const [compactReport, setCompactReport] = useState(false);
+  const [showTop, setShowTop] = useState(false);
+  const [batchProgress, setBatchProgress] = useState(null);
 
   const loadTemplates = useCallback(async () => {
     try {
@@ -73,6 +103,7 @@ export default function ReportStudio() {
       const r = await axios.get(api + "/api/reports/sources", { headers });
       setSources(r.data.sources || []);
     } catch { setError("Could not load your source library."); }
+    finally { setSourcesLoaded(true); }
   }, [headers]);
 
   const loadReports = useCallback(async () => {
@@ -80,6 +111,7 @@ export default function ReportStudio() {
       const r = await axios.get(api + "/api/reports", { headers });
       setReports(r.data.reports || []);
     } catch { /* non-fatal */ }
+    finally { setReportsLoaded(true); }
   }, [headers]);
 
   const loadProviders = useCallback(async () => {
@@ -102,6 +134,18 @@ export default function ReportStudio() {
   useEffect(() => { loadTemplates(); loadSources(); loadReports(); loadProviders(); runHealth(); }, [loadTemplates, loadSources, loadReports, loadProviders, runHealth]);
 
   const flash = (msg) => { setNotice(msg); setTimeout(() => setNotice(""), 4000); };
+
+  const copyText = async (text, label) => {
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text || "");
+      else {
+        const ta = document.createElement("textarea");
+        ta.value = text || ""; document.body.appendChild(ta); ta.select();
+        document.execCommand("copy"); document.body.removeChild(ta);
+      }
+      flash((label || "Text") + " copied to clipboard.");
+    } catch { setError("Could not copy to clipboard."); }
+  };
 
   /* ------------------------- ingestion ------------------------- */
   const uploadFiles = async (e) => {
@@ -151,6 +195,7 @@ export default function ReportStudio() {
   };
 
   const removeSource = async (id) => {
+    if (!window.confirm("Remove this source from your library? Reports already generated are not affected.")) return;
     try {
       await axios.delete(api + "/api/reports/sources/" + id, { headers });
       setSelected((x) => x.filter((v) => v !== id));
@@ -164,26 +209,83 @@ export default function ReportStudio() {
   const generate = async (e) => {
     e.preventDefault();
     if (!selected.length) return;
-    setBusy("generate"); setError(""); setReport(null); setStreamText("");
+    setBusy("generate"); setError(""); setReport(null); setStreamText(""); setChainStep("");
     try {
       if (perSource) {
-        const r = await axios.post(api + "/api/reports/batch",
-          { perSource: true, objective, template, sourceIds: selected }, { headers });
-        flash(`Batch complete: ${r.data.results.filter((x) => x.status === "complete").length}/${r.data.count} reports.`);
-        await loadReports();
-        const firstOk = r.data.results.find((x) => x.reportId);
-        if (firstOk) await openReport(firstOk.reportId);
+        await streamBatch();
       } else if (useStream) {
         await streamGenerate();
       } else {
         const r = await axios.post(api + "/api/reports/generate",
-          { title, objective, template, sourceIds: selected }, { headers });
+          { title, objective, template, sourceIds: selected, chain: chainMode, parallel: parallelMode }, { headers });
         setReport(r.data.report);
         await loadReports();
       }
     } catch (err) {
       setError(err.response?.data?.error || "Could not generate the report.");
-    } finally { setBusy(""); }
+    } finally { setBusy(""); setChainStep(""); setBatchProgress(null); }
+  };
+
+  // Keyboard shortcuts: Ctrl/Cmd+Enter generates, Esc closes an open report.
+  useEffect(() => {
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        if (selected.length && !busy) { e.preventDefault(); generate({ preventDefault() {} }); }
+      } else if (e.key === "Escape" && report) {
+        setReport(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, busy, report]);
+
+  useEffect(() => {
+    const onScroll = () => setShowTop(window.scrollY > 600);
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // Streaming batch generation: live per-report progress over SSE.
+  const streamBatch = async () => {
+    setBatchProgress({ done: 0, total: selected.length });
+    const resp = await fetch(api + "/api/reports/batch/stream", {
+      method: "POST",
+      headers: { ...headers, "Content-Type": "application/json" },
+      body: JSON.stringify({ perSource: true, objective, template, sourceIds: selected, chain: chainMode, parallel: parallelMode }),
+    });
+    if (!resp.ok || !resp.body) {
+      const j = await resp.json().catch(() => ({}));
+      throw new Error(j.error || "Batch streaming failed to start.");
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "", event = "", firstId = null, summary = null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl); buffer = buffer.slice(nl + 1);
+        if (line.startsWith("event:")) { event = line.slice(6).trim(); continue; }
+        if (line.startsWith("data:")) {
+          const data = line.slice(5).trim();
+          try {
+            const j = JSON.parse(data);
+            if (event === "start") setBatchProgress({ done: 0, total: j.total });
+            else if (event === "progress") setBatchProgress({ done: j.done, total: j.total });
+            else if (event === "done") { summary = j; firstId = j.firstReportId; }
+            else if (event === "error") throw new Error(j.error || "Batch failed.");
+          } catch (e) { if (event === "error") throw e; }
+        }
+      }
+    }
+    await loadReports();
+    setBatchProgress(null);
+    if (summary) flash(`Batch complete: ${summary.completed}/${summary.count} reports.`);
+    if (firstId) await openReport(firstId);
   };
 
   // Streaming generation via fetch + SSE parsing (EventSource can't send auth headers).
@@ -192,7 +294,7 @@ export default function ReportStudio() {
     const resp = await fetch(api + "/api/reports/generate/stream", {
       method: "POST",
       headers: { ...headers, "Content-Type": "application/json" },
-      body: JSON.stringify({ title, objective, template, sourceIds: selected }),
+      body: JSON.stringify({ title, objective, template, sourceIds: selected, chain: chainMode, parallel: parallelMode }),
     });
     if (!resp.ok || !resp.body) {
       const j = await resp.json().catch(() => ({}));
@@ -214,12 +316,15 @@ export default function ReportStudio() {
           try {
             const j = JSON.parse(data);
             if (event === "token" && j.t) { acc += j.t; setStreamText(acc); }
+            else if (event === "step") { setChainStep(j.label || ""); }
+            else if (event === "final" && typeof j.content === "string") { acc = j.content; setStreamText(acc); }
             else if (event === "done") { doneId = j.reportId; }
             else if (event === "error") { throw new Error(j.error || "Generation failed."); }
           } catch (e) { if (event === "error") throw e; }
         }
       }
     }
+    setChainStep("");
     await loadReports();
     if (doneId) { setStreamText(""); await openReport(doneId); }
   };
@@ -228,10 +333,10 @@ export default function ReportStudio() {
   const ask = async (e) => {
     e.preventDefault();
     if (!question.trim() || !selected.length) { setError("Select at least one source and type a question."); return; }
-    setAsking(true); setError(""); setAnswer(null); setAnswerCitations([]);
+    setAsking(true); setError(""); setAnswer(null); setAnswerCitations([]); setAnswerCached(false);
     try {
       const r = await axios.post(api + "/api/reports/ask", { question, sourceIds: selected }, { headers });
-      setAnswer(r.data.answer); setAnswerCitations(r.data.citations || []);
+      setAnswer(r.data.answer); setAnswerCitations(r.data.citations || []); setAnswerCached(!!r.data.cached);
     } catch (err) {
       setError(err.response?.data?.error || "Could not answer that question.");
     } finally { setAsking(false); }
@@ -266,6 +371,22 @@ export default function ReportStudio() {
       setReport(r.data.report);
       window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     } catch { setError("Could not open that report."); }
+  };
+
+  const regenerate = async (rpt) => {
+    const ids = (rpt.sourceIds || []).map((x) => (x && x._id ? x._id : x)).filter(Boolean).map(String);
+    if (!ids.length) { setError("This report has no linked sources to regenerate from."); return; }
+    setBusy("generate"); setError(""); setStreamText(""); setChainStep("");
+    try {
+      const r = await axios.post(api + "/api/reports/generate",
+        { title: rpt.title, objective: rpt.objective, template: rpt.template, sourceIds: ids, chain: chainMode, parallel: parallelMode }, { headers });
+      setReport(r.data.report);
+      await loadReports();
+      flash("Report regenerated.");
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+    } catch (err) {
+      setError(err.response?.data?.error || "Could not regenerate the report.");
+    } finally { setBusy(""); setChainStep(""); }
   };
 
   const download = async (id, format) => {
@@ -343,13 +464,22 @@ export default function ReportStudio() {
           </button>
         </div>
 
-        {error && <p className="mb-4 rounded-lg bg-red-100 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">{error}</p>}
+        {error && (
+          <div className="mb-4 flex items-start justify-between gap-3 rounded-lg bg-red-100 p-3 text-sm text-red-700 dark:bg-red-950 dark:text-red-300">
+            <span>{error}</span>
+            <button onClick={() => setError("")} className="shrink-0 text-red-500 hover:text-red-700" title="Dismiss">✕</button>
+          </div>
+        )}
         {notice && <p className="mb-4 rounded-lg bg-emerald-100 p-3 text-sm text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300">{notice}</p>}
 
         <div className="grid gap-6 lg:grid-cols-2">
           {/* ---------------- Source library ---------------- */}
           <section className="rounded-2xl bg-white p-5 shadow dark:bg-slate-900">
             <h2 className="text-xl font-semibold">1. Source library</h2>
+            <div className="mt-1 flex gap-3 text-xs text-slate-500">
+              <button type="button" onClick={() => setSelected(sources.map((s) => s._id))} className="hover:text-orange-600">Select all</button>
+              <button type="button" onClick={() => setSelected([])} className="hover:text-orange-600">Clear</button>
+            </div>
 
             <div className="mt-3 flex gap-2">
               <button onClick={() => setTab("upload")} className={tabCls("upload")}>Upload files</button>
@@ -397,13 +527,22 @@ export default function ReportStudio() {
             )}
 
             <div className="mt-5 space-y-2">
-              {sources.length ? sources.map((s) => (
+              {!sourcesLoaded ? (
+                [0, 1, 2].map((i) => (
+                  <div key={"sk" + i} className="h-14 animate-pulse rounded border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800" />
+                ))
+              ) : sources.length ? sources.map((s) => (
                 <div key={s._id} className="flex items-center gap-3 rounded border border-slate-200 p-3 dark:border-slate-700">
                   <input type="checkbox" checked={selected.includes(s._id)} onChange={() => toggle(s._id)} />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                       <span className="truncate font-medium">{s.title}</span>
                       <SourceBadge type={s.sourceType} />
+                      {s.documentType && s.documentType !== "unknown" && (
+                        <span className="rounded bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-600 dark:bg-indigo-950 dark:text-indigo-300">
+                          {DOC_BADGE[s.documentType] || s.documentType}
+                        </span>
+                      )}
                     </div>
                     <div className="text-xs text-slate-500">
                       {s.chunkCount} chunks · {(s.charCount || 0).toLocaleString()} chars{s.pages ? ` · ${s.pages} pages` : ""}
@@ -411,7 +550,7 @@ export default function ReportStudio() {
                   </div>
                   <button onClick={() => removeSource(s._id)} className="text-xs text-slate-400 hover:text-red-600">Remove</button>
                 </div>
-              )) : <p className="text-slate-500">Add a source to begin.</p>}
+              )) : <p className="text-slate-500">No sources yet. Upload a file, add a link, or paste text to begin.</p>}
             </div>
           </section>
 
@@ -438,22 +577,54 @@ export default function ReportStudio() {
                   Stream the report live as it is written
                 </label>
               )}
+              <label className="flex items-start gap-2 rounded-lg bg-orange-50 p-2.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                <input type="checkbox" checked={chainMode} onChange={(e) => setChainMode(e.target.checked)} className="mt-0.5" />
+                <span><strong>Deep reasoning (multi-step)</strong> — the model first extracts a grounded evidence brief, then drafts, then (for non-streamed reports) verifies every claim against your sources. Higher quality and fewer errors; a little slower. Turn off for the fastest single-pass draft.</span>
+              </label>
+              <label className="flex items-start gap-2 rounded-lg bg-orange-50 p-2.5 text-xs text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+                <input type="checkbox" checked={parallelMode} onChange={(e) => setParallelMode(e.target.checked)} className="mt-0.5" />
+                <span><strong>Fast parallel (multi-model)</strong> — for 2+ sources, each source is analysed at the same time on a different AI provider, then combined into one report. Faster for multi-document reports and avoids truncation. Uses more of your provider quota.</span>
+              </label>
               <p className="text-xs text-slate-500">{selected.length} source(s) selected.</p>
               <button disabled={busy === "generate" || !selected.length}
                 className="rounded bg-orange-600 px-4 py-2 text-white disabled:opacity-50">
                 {busy === "generate" ? "Working…" : perSource ? "Generate batch" : "Generate structured report"}
               </button>
+              {busy === "generate" && perSource && batchProgress && (
+                <div className="space-y-1">
+                  <p className="flex items-center gap-2 text-xs text-slate-500">
+                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-orange-500" />
+                    {batchProgress.done} of {batchProgress.total} report{batchProgress.total === 1 ? "" : "s"} done…
+                  </p>
+                  <div className="h-1.5 w-full overflow-hidden rounded bg-slate-200 dark:bg-slate-700">
+                    <div className="h-full bg-orange-500 transition-all"
+                      style={{ width: `${batchProgress.total ? Math.round((batchProgress.done / batchProgress.total) * 100) : 0}%` }} />
+                  </div>
+                </div>
+              )}
             </form>
 
-            {reports.length > 0 && (
+            {(!reportsLoaded || reports.length > 0) && (
               <div className="mt-6">
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-500">Recent reports</h3>
+                {!reportsLoaded && (
+                  <div className="mt-2 space-y-1">
+                    {[0, 1].map((i) => (
+                      <div key={"rsk" + i} className="h-8 animate-pulse rounded border border-slate-200 bg-slate-100 dark:border-slate-700 dark:bg-slate-800" />
+                    ))}
+                  </div>
+                )}
+                <input value={reportSearch} onChange={(e) => setReportSearch(e.target.value)}
+                  placeholder="Search reports…" className="mt-2 w-full rounded border border-slate-300 px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-800" />
                 <div className="mt-2 max-h-56 space-y-1 overflow-auto">
-                  {reports.map((r) => (
+                  {reports.filter((r) => !reportSearch || ((r.title || "") + " " + (r.templateLabel || r.template || "")).toLowerCase().includes(reportSearch.toLowerCase())).map((r) => (
                     <div key={r._id} className="flex items-center gap-1 rounded border border-slate-200 px-2 py-1.5 text-sm dark:border-slate-700">
                       <button onClick={() => openReport(r._id)} className="min-w-0 flex-1 truncate text-left hover:text-orange-600" title="Open">
                         {r.title}
                         <span className="ml-2 text-xs text-slate-400">{r.templateLabel || r.template}</span>
+                        {r.generationMode && r.generationMode !== "single-pass" && (
+                          <span className="ml-2 rounded bg-orange-100 px-1 text-[10px] text-orange-700 dark:bg-orange-950 dark:text-orange-300">{r.generationMode.includes("parallel") ? "parallel" : r.generationMode.includes("verified") ? "verified" : "multi-step"}</span>
+                        )}
                       </button>
                       <button onClick={() => renameRpt(r._id, r.title)} title="Rename" className="rounded px-1.5 text-xs text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">✎</button>
                       <button onClick={() => duplicateRpt(r._id)} title="Duplicate" className="rounded px-1.5 text-xs text-slate-400 hover:text-slate-700 dark:hover:text-slate-200">⧉</button>
@@ -475,6 +646,7 @@ export default function ReportStudio() {
           <form onSubmit={ask} className="mt-3 flex flex-col gap-2 sm:flex-row">
             <input value={question} onChange={(e) => setQuestion(e.target.value)}
               placeholder="e.g. What were the main adverse events reported?" className={inputCls + " flex-1"} />
+            <VoiceInput value={question} onChange={(e) => setQuestion(e.target.value)} />
             <button disabled={asking || !selected.length || !question.trim()}
               className="rounded bg-orange-600 px-4 py-2 text-white disabled:opacity-50">
               {asking ? "Thinking…" : "Ask"}
@@ -482,6 +654,13 @@ export default function ReportStudio() {
           </form>
           {answer && (
             <div className="mt-4 rounded-lg border border-slate-200 p-4 dark:border-slate-700">
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <div className="flex-1">{answer && <ReadAloud text={toPlain(answer)} className="" />}</div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {answerCached && <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500 dark:bg-slate-800" title="Served from cache">cached</span>}
+                  <button onClick={() => copyText(answer, "Answer")} className="rounded border border-slate-300 px-2 py-0.5 text-xs dark:border-slate-600">Copy</button>
+                </div>
+              </div>
               <div className="report-prose leading-7" dangerouslySetInnerHTML={{ __html: answerRendered }} />
               {answerCitations.length > 0 && <CitationList citations={answerCitations} />}
             </div>
@@ -489,12 +668,14 @@ export default function ReportStudio() {
         </section>
 
         {/* ---------------- Live streaming view ---------------- */}
-        {busy === "generate" && useStream && !perSource && streamText && (
+        {busy === "generate" && useStream && !perSource && (streamText || chainStep) && (
           <article className="mt-6 rounded-2xl border-2 border-orange-200 bg-white p-6 shadow dark:border-orange-900 dark:bg-slate-900">
             <p className="mb-3 flex items-center gap-2 text-sm font-medium text-orange-600">
-              <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-orange-500" /> Writing report…
+              <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-orange-500" /> {chainStep || "Writing report…"}
             </p>
-            <div className="report-prose leading-7" dangerouslySetInnerHTML={{ __html: streamRendered }} />
+            {streamText
+              ? <div className="report-prose leading-7" dangerouslySetInnerHTML={{ __html: streamRendered }} />
+              : <p className="text-sm text-slate-500">Reading your sources and preparing a grounded evidence brief…</p>}
           </article>
         )}
 
@@ -504,7 +685,17 @@ export default function ReportStudio() {
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 pb-4 dark:border-slate-700">
               <div>
                 <h2 className="text-2xl font-bold">{report.title}</h2>
-                <p className="mt-1 text-sm text-slate-500">{report.templateLabel || report.template}</p>
+                <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500">
+                  <span>{report.templateLabel || report.template}</span>
+                  <span className="text-slate-400">· {(report.content || "").split(/\s+/).filter(Boolean).length.toLocaleString()} words</span>
+                  {report.generationMode && report.generationMode !== "single-pass" && (
+                    <span className="rounded bg-orange-100 px-2 py-0.5 text-xs font-medium text-orange-700 dark:bg-orange-950 dark:text-orange-300"
+                      title="Generated with the multi-step chain: evidence brief → draft → verify">
+                      {report.generationMode.includes("verified") ? "Multi-step · verified" : "Multi-step"}
+                    </span>
+                  )}
+                </p>
+                {report.objective && <p className="mt-1 text-xs text-slate-400">{report.objective}</p>}
               </div>
               <div className="flex flex-wrap gap-2">
                 <button onClick={() => download(report._id, "pdf")} disabled={busy === "export-pdf"}
@@ -513,9 +704,29 @@ export default function ReportStudio() {
                   className="rounded bg-slate-700 px-3 py-1.5 text-sm text-white disabled:opacity-50">Download Word</button>
                 <button onClick={() => download(report._id, "md")} disabled={busy === "export-md"}
                   className="rounded border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600">Markdown</button>
+                <button onClick={() => copyText(report.content, "Report")}
+                  className="rounded border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600">Copy</button>
+                <button onClick={() => regenerate(report)} disabled={busy === "generate"}
+                  className="rounded border border-orange-300 px-3 py-1.5 text-sm text-orange-700 disabled:opacity-50 dark:border-orange-800 dark:text-orange-300">
+                  {busy === "generate" ? "Regenerating…" : "Regenerate"}</button>
+                <button onClick={() => setCompactReport((v) => !v)}
+                  title="Toggle reading density"
+                  className="rounded border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600">
+                  {compactReport ? "Comfortable" : "Compact"}</button>
+                <button onClick={() => setReport(null)} className="rounded border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-600">Close</button>
               </div>
             </div>
-            <div className="report-prose leading-7" dangerouslySetInnerHTML={{ __html: rendered }} />
+            {report && <ReadAloud text={toPlain(report.content)} className="mb-4" />}
+            <div className={"report-prose " + (compactReport ? "text-sm leading-6" : "leading-7")} dangerouslySetInnerHTML={{ __html: rendered }} />
+            {report.outline && report.outline.trim() && (
+              <details className="mt-6 rounded-lg border border-slate-200 p-3 text-sm dark:border-slate-700">
+                <summary className="cursor-pointer font-semibold text-slate-600 dark:text-slate-300">
+                  Evidence brief (facts extracted from your sources before drafting)
+                </summary>
+                <div className="report-prose mt-3 leading-7"
+                  dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(marked.parse(report.outline, { gfm: true })) }} />
+              </details>
+            )}
             {report.citations && report.citations.length > 0 && (
               <div className="mt-6 border-t border-slate-200 pt-4 dark:border-slate-700">
                 <CitationList citations={report.citations} mode={report.retrievalMode} />
@@ -524,6 +735,13 @@ export default function ReportStudio() {
           </article>
         )}
       </div>
+      {showTop && (
+        <button onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })}
+          title="Back to top"
+          className="fixed bottom-6 right-6 z-40 rounded-full bg-orange-600 px-4 py-3 text-sm text-white shadow-lg hover:bg-orange-700">
+          ↑ Top
+        </button>
+      )}
     </main>
   );
 }

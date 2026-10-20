@@ -27,3 +27,8 @@ Thumbs.db
 # Backups and scratch
 *.bak
 *.b64
+
+# generated deliverables and local service backups (not part of the app)
+Claude outputs/
+backend/services/llmService.backup.js
+backend/services/llmService.enhanced.js

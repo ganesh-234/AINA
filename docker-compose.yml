@@ -1,0 +1,29 @@
+# Dockerized frontend + backend that use YOUR existing MongoDB on this PC
+# (the "aina" database), so your current account and data are available.
+# Requires your local MongoDB to accept connections from the container
+# (see the note from Claude: set bindIp to 0.0.0.0 and restart MongoDB).
+# Host ports are configurable so Docker never clashes with your dev servers.
+services:
+  backend:
+    build: ./backend
+    env_file: ./backend/.env.local
+    environment:
+      - NODE_ENV=production
+      - MONGO_URI=mongodb://host.docker.internal:27017/aina
+      - CLIENT_ORIGIN=http://localhost:${FRONTEND_PORT:-5173}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${BACKEND_PORT:-5050}:5000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_SERVER_URL: ${VITE_SERVER_URL:-http://localhost:5050}
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      - backend
+    restart: unless-stopped

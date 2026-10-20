@@ -8,7 +8,11 @@ module.exports = mongoose.model(
       title: { type: String, required: true, trim: true },
       content: { type: String, required: true },
       // Each chunk carries an optional semantic embedding for RAG retrieval.
-      chunks: [{ index: Number, text: String, embedding: { type: [Number], default: undefined } }],
+      chunks: [{ index: Number, text: String, page: Number, section: String, evidenceIds: [String], embedding: { type: [Number], default: undefined } }],
+      documentType: { type: String, default: "other" },
+      documentMetadata: { title: String, doi: String, publicationYear: String, abstract: String },
+      sections: [{ id: String, heading: String, page: Number, charCount: Number }],
+      evidence: [{ id: String, kind: String, claim: String, quote: String, section: String, page: Number, confidence: Number }],
       // provenance / ingestion metadata
       sourceType: { type: String, enum: ["paste", "pdf", "pdf-ai", "image", "docx", "text", "url", "url-pdf", "file"], default: "paste" },
       originalName: { type: String, default: "" },
