@@ -2,7 +2,7 @@ require("dotenv").config(); // Optional safeguard
 
 const Conversation = require("../models/Conversation");
 const mongoose = require("mongoose");
-const { generateResponse } = require("../services/llmService");
+const { generateResponse, getProviderStatus } = require("../services/llmService");
 
 const createConversation = async (req, res) => {
   try {
@@ -65,9 +65,8 @@ const sendMessage = async (req, res) => {
     }
 
     // 4) Generate AI response
-      const groqSet = Boolean(process.env.GROQ_API_KEY?.trim());
-      const hfSet = Boolean(process.env.HF_API_KEY?.trim());
-      console.log(`[chatControllers] GROQ set=${groqSet} HF set=${hfSet}`);
+      const activeProviders = getProviderStatus().filter((provider) => provider.configured).map((provider) => provider.key);
+      console.log(`[chatControllers] active provider pool=${activeProviders.join(",") || "none"}`);
 
       const aiText = await genmerateTherapyResponse(
         conversation.messages,
@@ -82,7 +81,7 @@ const sendMessage = async (req, res) => {
     await conversation.save();
 
     // 6) Return the assistant’s reply
-    res.json({ response: aiText, debug: { groq: groqSet, hf: hfSet } });
+    res.json({ response: aiText });
   } catch (error) {
     console.error("sendMessage error:", error);
     res.status(500).json({ error: error.message });
@@ -113,9 +112,7 @@ const getSingleConversation = async (req, res) => {
       userId: req.user.id,
     });
     if (!singleconversation) {
-      res
-        .status(401)
-        .json({ message: "Chat doesnot exist or you don't have access to it" });
+      return res.status(404).json({ message: "Chat does not exist or you do not have access to it." });
     }
     res.status(200).json({
       message: "Conversation fetched sucessfully",
@@ -139,7 +136,7 @@ const editChatTitle = async (req, res) => {
       userId: req.user.id,
     });
     if (!conversation) {
-      return res.status(400).josn({ message: "Conversation not found" });
+      return res.status(404).json({ message: "Conversation not found" });
     }
     //update the title
     conversation.title = editedTitle;

@@ -14,6 +14,7 @@ module.exports = mongoose.model(
       // Passages used to ground the report, for traceability.
       citations: [{ sourceTitle: String, snippet: String, score: Number }],
       retrievalMode: { type: String, default: "" }, // long-context | semantic-rag
+      generationMode: { type: String, default: "single-pass" }, // single-pass | chained | chained+verified
       sourceIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "Source" }],
       sourceTitles: [{ type: String }],
       status: { type: String, enum: ["complete", "failed"], default: "complete" },

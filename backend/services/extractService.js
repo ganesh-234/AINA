@@ -14,8 +14,12 @@ const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
 const { JSDOM } = require("jsdom");
 const { Readability } = require("@mozilla/readability");
+const dns = require("dns").promises;
+const net = require("net");
 
 const MAX_TEXT = 2000000; // ~2MB text ceiling to protect the DB / LLM budget
+const MAX_REMOTE_BYTES = parseInt(process.env.MAX_REMOTE_SOURCE_BYTES || String(20 * 1024 * 1024), 10);
+const MAX_URL_REDIRECTS = 4;
 
 /* ---------------- AI (Gemini vision) document extraction ---------------- */
 // Uses Gemini's multimodal API to OCR scanned pages AND reconstruct tables as
@@ -35,6 +39,13 @@ const EXTRACT_PROMPTS = {
     "Extract ONLY the data tables from this document, each as a clean GitHub-flavored Markdown table with a header row. " +
     "Include each table's caption or number if present. Keep numeric values, units and confidence intervals exactly as shown. " +
     "Ignore body prose, abstract, and references. If there are no tables, output nothing.",
+  structured:
+    "Extract a concise KEY DATA sheet of the most important quantitative and factual data points from this document. " +
+    "Group the items under short '###' Markdown subheadings chosen from: Key Figures, Findings, Methods & Design, " +
+    "Entities, Dates — include only the groups the document actually supports. Give each value with its unit exactly as " +
+    "shown (numbers, dosages, p-values, confidence intervals, sample sizes). Output GitHub-flavored Markdown bullets only. " +
+    "Include ONLY data present in the document; do not infer, calculate, summarize prose, or add commentary. If the document " +
+    "has no extractable data points, output nothing.",
 };
 
 async function geminiExtractDocument(buffer, mimeType, kind = "full") {
@@ -69,6 +80,23 @@ async function geminiExtractDocument(buffer, mimeType, kind = "full") {
   const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
   if (!text) throw new Error("Gemini returned no extractable text.");
   return text;
+}
+
+// Chained AI enrichment: for a text-rich document whose plain-text layer we
+// already have, run two focused extraction passes CONCURRENTLY — one that
+// rebuilds the data tables, one that distils a "Key Data" sheet — and return
+// them as clean Markdown blocks. Each pass is best-effort: a failure of one
+// does not sink the other, and neither is fatal to ingestion.
+async function aiEnrich(buffer, mimeType) {
+  const run = (kind) =>
+    geminiExtractDocument(buffer, mimeType, kind)
+      .then((t) => normalizeWhitespace(t))
+      .catch((e) => {
+        console.warn(`[extract] AI ${kind} pass failed:`, e.message);
+        return "";
+      });
+  const [structured, tables] = await Promise.all([run("structured"), run("tables")]);
+  return { structured, tables };
 }
 
 function normalizeWhitespace(text) {
@@ -139,19 +167,20 @@ async function extractFromBuffer(buffer, opts) {
     } else if (mode === "ai" && canAi && pdfText.length >= 200) {
       // Text-rich PDF + high-accuracy requested: keep the full plain text (which
       // AI full-extraction can refuse to reproduce for copyrighted articles) and
-      // augment it with clean, correctly-structured tables extracted by AI.
+      // augment it, via a two-pass AI chain, with clean AI-reconstructed tables
+      // and a distilled "Key Data" sheet.
       text = pdfText;
       meta.kind = "pdf";
       meta.extractedBy = "pdf-parse";
-      try {
-        const tables = normalizeWhitespace(await geminiExtractDocument(buffer, "application/pdf", "tables"));
-        if (tables && tables.length > 40) {
-          text = pdfText + "\n\n## Tables (AI-extracted)\n\n" + tables;
-          meta.kind = "pdf-ai";
-          meta.extractedBy = "pdf-parse+ai-tables";
-        }
-      } catch (e) {
-        console.warn("[extract] AI table extraction failed:", e.message);
+      const { structured, tables } = await aiEnrich(buffer, "application/pdf");
+      let extra = "";
+      if (structured && structured.length > 40) extra += "\n\n## Key Data (AI-extracted)\n\n" + structured;
+      if (tables && tables.length > 40) extra += "\n\n## Tables (AI-extracted)\n\n" + tables;
+      if (extra) {
+        text = pdfText + extra;
+        meta.kind = "pdf-ai";
+        meta.extractedBy = "pdf-parse+ai";
+        meta.aiEnriched = { keyData: Boolean(structured), tables: Boolean(tables) };
       }
     } else {
       // Fast path (default for normal digital PDFs).
@@ -195,34 +224,108 @@ async function extractFromBuffer(buffer, opts) {
 }
 
 /* ----------------------------- url -------------------------------- */
-async function extractFromUrl(rawUrl) {
+function isPrivateAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) {
+    const [a, b] = address.split(".").map(Number);
+    return a === 0 || a === 10 || a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224;
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    if (normalized.startsWith("::ffff:")) return isPrivateAddress(normalized.slice(7));
+    return normalized === "::" || normalized === "::1" ||
+      normalized.startsWith("fc") || normalized.startsWith("fd") ||
+      normalized.startsWith("fe8") || normalized.startsWith("fe9") ||
+      normalized.startsWith("fea") || normalized.startsWith("feb");
+  }
+  return true;
+}
+
+async function safeHttpUrl(rawUrl) {
   let url;
   try {
     url = new URL(String(rawUrl).trim());
   } catch {
     throw new Error("That does not look like a valid URL.");
   }
-  if (!/^https?:$/.test(url.protocol)) {
-    throw new Error("Only http and https links are supported.");
-  }
+  if (!/^https?:$/.test(url.protocol)) throw new Error("Only http and https links are supported.");
+  if (url.username || url.password) throw new Error("URLs with embedded credentials are not supported.");
+  if (url.hostname.toLowerCase() === "localhost") throw new Error("Local network URLs are not supported.");
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
-  let response;
+  let addresses;
   try {
-    response = await fetch(url.href, {
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; AINA-ReportStudio/1.0; +https://aina.app)",
-        Accept: "text/html,application/xhtml+xml,application/pdf,*/*",
-      },
-    });
-  } catch (e) {
-    clearTimeout(timeout);
-    throw new Error("Could not reach that URL: " + (e.message || "network error"));
+    addresses = await dns.lookup(url.hostname, { all: true, verbatim: true });
+  } catch {
+    throw new Error("Could not resolve the URL host.");
   }
-  clearTimeout(timeout);
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error("Local or private network URLs are not supported.");
+  }
+  return url;
+}
+
+async function readResponseBuffer(response) {
+  const length = Number(response.headers.get("content-length") || 0);
+  if (Number.isFinite(length) && length > MAX_REMOTE_BYTES) {
+    throw new Error("The linked file is too large to import.");
+  }
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_REMOTE_BYTES) {
+      await reader.cancel();
+      throw new Error("The linked file is too large to import.");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
+}
+
+async function fetchSafeUrl(rawUrl) {
+  let url = await safeHttpUrl(rawUrl);
+  for (let hop = 0; hop <= MAX_URL_REDIRECTS; hop += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000);
+    let response;
+    try {
+      response = await fetch(url.href, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "Mozilla/5.0 (compatible; AINA-ReportStudio/1.0; +https://aina.app)",
+          Accept: "text/html,application/xhtml+xml,application/pdf,*/*",
+        },
+      });
+    } catch (e) {
+      throw new Error("Could not reach that URL: " + (e.message || "network error"));
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("The URL redirected without a destination.");
+      if (hop === MAX_URL_REDIRECTS) throw new Error("The URL redirected too many times.");
+      url = await safeHttpUrl(new URL(location, url).href);
+      continue;
+    }
+    return { url, response };
+  }
+  throw new Error("The URL redirected too many times.");
+}
+
+async function extractFromUrl(rawUrl) {
+  const { url, response } = await fetchSafeUrl(rawUrl);
 
   if (!response.ok) {
     throw new Error("The URL returned HTTP " + response.status + ".");
@@ -232,7 +335,7 @@ async function extractFromUrl(rawUrl) {
 
   // Remote PDF
   if (contentType.includes("application/pdf") || url.pathname.toLowerCase().endsWith(".pdf")) {
-    const buffer = Buffer.from(await response.arrayBuffer());
+    const buffer = await readResponseBuffer(response);
     const data = await pdfParse(buffer);
     const text = normalizeWhitespace(data.text || "");
     if (!text || text.length < 20) throw new Error("The linked PDF had no extractable text (it may be scanned).");
@@ -242,7 +345,7 @@ async function extractFromUrl(rawUrl) {
   }
 
   // HTML article
-  const html = await response.text();
+  const html = (await readResponseBuffer(response)).toString("utf8");
   const dom = new JSDOM(html, { url: url.href });
   const doc = dom.window.document;
   let title = (doc.querySelector("title")?.textContent || "").trim();
@@ -267,4 +370,4 @@ async function extractFromUrl(rawUrl) {
   return { title: title || url.hostname, text, meta: { kind: "url", url: url.href } };
 }
 
-module.exports = { extractFromBuffer, extractFromUrl, normalizeWhitespace };
+module.exports = { extractFromBuffer, extractFromUrl, normalizeWhitespace, safeHttpUrl, isPrivateAddress };
